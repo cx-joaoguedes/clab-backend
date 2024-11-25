@@ -1,16 +1,19 @@
+require('dotenv').config();
 const express = require('express')
 const swaggerUi = require('swagger-ui-express')
 const swaggerDocument = require('../swagger/swagger.json')
+const connectDB = require('./config/database')
 const app = express()
 const port = process.env.PORT || 3000
 
-app.use(express.json())
+app.use(express.json()) // Use request JSON body
+connectDB() // Connect to mongoDB database
 
 // Landing Page for the webservice
 app.get('/', (req,res)=>res.send('Landing Route for webservice'))
 
 //Routing /api requests to the api router
-const apiRoutes = require('./routes/api-routes')
+const apiRoutes = require('./routes/api')
 app.use('/api', apiRoutes)
 
 //Routing to Swagger
