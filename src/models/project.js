@@ -17,6 +17,19 @@ const projectSchema = mongoose.Schema({
     type: String,
     required: true
   },
+  upload_state: {
+    type: String,
+    required: true,
+    default: "pending"
+  },
+  file_count: {
+    type: Number,
+    default: 0
+  },
+  dir_count: {
+    type: Number,
+    default: 0
+  },
   createdAt: {
     type: Date,
     default: Date.now,

@@ -1,31 +1,30 @@
+const express = require('express');
+const http = require('http');
+const connectDB = require('./config/database');
+const socketLoader = require('./loaders/socketLoader');
+const appLoader = require('./loaders/appLoader');
+
 require('dotenv').config();
-const express = require('express')
-const swaggerUi = require('swagger-ui-express')
-const swaggerDocument = require('../swagger/swagger.json')
-const connectDB = require('./config/database')
-const app = express()
-const port = process.env.PORT || 3000
 
-app.use(express.json()) // Use request JSON body
-connectDB() // Connect to mongoDB database
+const app = express();
+const port = process.env.PORT || 3000;
 
-// Landing Page for the webservice
-app.get('/', (req,res)=>res.send('Landing Route for webservice'))
+// Connect to the database
+connectDB();
 
-//Routing /api requests to the api router
-const apiRoutes = require('./routes/api')
-app.use('/api', apiRoutes)
+// Initialize loaders (middlewares, routes, etc.)
+appLoader(app);
 
-//Routing to Swagger
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+// Create HTTP server for socket.io
+const server = http.createServer(app);
 
-// Catch unrouted requests to 404
-app.use((req, res, next) => {
-    const error = new Error('Route not Found')
-    error.status = 404
-    next(error)
-  })
+// Load socket.io and register event handlers
+const io = socketLoader(server);
 
-app.listen(port, ()=>{
-    console.log(`Webservice listening in port ${port}`)
-})
+// Register `io` globally using app.set()
+app.set('io', io);
+
+// Start the server
+server.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});

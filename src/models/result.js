@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 
 const resultSchema = mongoose.Schema({
+    project_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'projects',
+        required: true
+    },
     scan_id: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'scans',
@@ -17,6 +22,11 @@ const resultSchema = mongoose.Schema({
     original_severity: {
         type: "String",
         required: true
+    },
+    node_count: {
+        type: "Number",
+        required: true,
+        default: 0
     },
     group_id: {
         type: mongoose.Schema.Types.ObjectId,

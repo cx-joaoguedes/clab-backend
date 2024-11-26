@@ -1,11 +1,13 @@
 const path = require('path');
 const gridFSManager = require('../config/gridfs')
+const { uploadFileToGridFS } = require('../utils/gridfs')
 const Scan = require('../models/scan')
 const Result = require('../models/result')
 const ResultNode = require('../models/result_node')
 const cxParsers = require('../utils/parsers/cx')
 const snykParsers = require('../utils/parsers/snyk')
 const crypto = require('crypto');
+const ObjectId = require('mongoose').Types.ObjectId
 
 const parserList = {
     cx: {
@@ -18,6 +20,35 @@ const parserList = {
     }
 }
 
+const GetResults = async (req, res) => {
+    const { project_id, scan_id } = req.params;
+    let { page = 1, limit = 10 } = req.query;
+
+    const mongoProjectId = new ObjectId(project_id);
+    const mongoScanId = new ObjectId(scan_id);
+
+    page = parseInt(page);
+    limit = parseInt(limit);
+
+    try {
+        const results = await Result.find({ project_id: mongoProjectId, scan_id: mongoScanId })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit));
+
+        const totalResults = await Result.countDocuments({ project_id: mongoProjectId, scan_id: mongoScanId });
+
+        res.json({
+            totalResults,
+            totalPages: Math.ceil(totalResults / limit),
+            currentPage: page,
+            results
+        });
+    } catch (error) {
+        console.error('Error fetching results:', error);
+        return res.status(500).send({ error: 'Failed to fetch results' });
+    }
+};
+
 const UploadResults = async (req, res) => {
     try {
         const resultsFile = req.file;
@@ -29,7 +60,9 @@ const UploadResults = async (req, res) => {
 
         if (!resultsFile || !project_id) return res.status(400).send({ error: 'scan file or project_id missing' })
 
-        const handleResponse = await handleResults(source, { fileType, fileBuffer, fileName }, project_id);
+        const owner = req.user.data.username
+
+        const handleResponse = await handleResults(source, { fileType, fileBuffer, fileName }, project_id, owner);
         return res.status(200).send(handleResponse);
     } catch (error) {
         console.error('Error parsing results:', error);
@@ -38,42 +71,24 @@ const UploadResults = async (req, res) => {
     }
 };
 
-const uploadScanSourceGridFS = async (fileData) => {
-    const { fileName, fileBuffer } = fileData
-    try {
-        const bucket = await gridFSManager.getScanFileContentBucket();
-        const uploadStream = bucket.openUploadStream(fileName);
-        uploadStream.end(fileBuffer);
-        return new Promise((resolve, reject) => {
-            uploadStream.on('finish', () => resolve(uploadStream.id));
-            uploadStream.on('error', (err) => reject(err));
-        });
-    } catch (error) {
-        console.error('Error uploading file to GridFS:', error);
-        throw error;
-    }
-};
-
-const uploadResultsAndNodes = async (resultData, scan_id) => {
-    const preparedResults = resultData.map(result => ({
-        original_query_name: result.original_query_name,
-        original_severity: result.original_severity,
+const uploadResultsAndNodes = async (resultData, scan_id, project_id) => {
+    const resultsDocs = resultData.map(result => ({
+        ...result,
+        project_id: new ObjectId(project_id),
         scan_id,
         unique_id: generateUniqueId(result),
+        node_count: result.nodes.length,
         group_id: null,
-    }))
-    const insertedResults = await Result.insertMany(preparedResults);
+    }));
+    const insertedResults = await Result.insertMany(resultsDocs);
 
     // Prepare nodes for bulk insertion
     const nodes = [];
     resultData.forEach((result, index) => {
-        const result_id = insertedResults[index]._id; // Match nodes to the inserted result
         result.nodes.forEach((node) => {
-            nodes.push({ ...node, result_id });
+            nodes.push({ ...node, result_id: insertedResults[index]._id });
         });
     });
-
-    // Bulk insert nodes
     const insertedNodes = await ResultNode.insertMany(nodes);
 
     return { insertedResults, insertedNodes }
@@ -111,25 +126,46 @@ const generateUniqueId = (result) => {
     return crypto.createHash('sha256').update(serializedData).digest('hex');
 };
 
-const handleResults = async (source, fileData, project_id) => {
-    const fileType = fileData.fileType
+const handleResults = async (source, fileData, project_id, owner) => {
+    try {
+        const fileType = fileData.fileType
 
-    const parsers = parserList[source];
-    if (!parsers) throw new Error(`No parsers found for source: ${source}`)
-    const parser = parsers[fileType]
-    if (!parser) throw new Error(`No parser found for extension: ${fileType}`)
+        // Selecting parser and parsing the results
+        const parsers = parserList[source];
+        if (!parsers) throw new Error(`No parsers found for source: ${source}`)
+        const parser = parsers[fileType]
+        if (!parser) throw new Error(`No parser found for extension: ${fileType}`)
+        const parsedResults = await parser(fileData.fileBuffer);
 
-    const parsedResults = await parser(fileData.fileBuffer);
+        // Create new Scan
+        const newScan = await new Scan({ project_id, source, type: fileType, owner })
+        const uploadedScan = await newScan.save();
+        const scanId = uploadedScan._id
 
-    // Upload scan file to GridFS
-    const uploadScanId = await uploadScanSourceGridFS(fileData)
-    // Create new Scan
-    const newScan = await new Scan({ project_id, content_id: uploadScanId, source, type: fileType })
-    const uploadedScan = await newScan.save();
+        // Upload scan file to GridFS
+        const bucket = gridFSManager.getScanFileContentBucket()
+        const sourceFileMetadata = { project_id: new ObjectId(project_id), source, type: fileType, scan_id: scanId, owner }
+        await uploadFileToGridFS(fileData.fileName, fileData.fileBuffer, sourceFileMetadata, bucket)
 
-    // Parse Results
-    const { insertedResults, insertedNodes } = await uploadResultsAndNodes(parsedResults, uploadedScan._id)
-    return { insertedResults: insertedResults.length, insertedNodes: insertedNodes.length }
-};
+        const { insertedResults, insertedNodes } = await uploadResultsAndNodes(parsedResults, scanId, project_id)
+        return { insertedResults: insertedResults.length, insertedNodes: insertedNodes.length }
+    } catch (error) {
+        console.error('Error handling results:', error);
+        throw error;
+    }
+}
 
-module.exports = { UploadResults };
+const GetResultNodes = async (req, res) => {
+    try {
+        const result_id = req.params.result_id
+        const mongoResultId = new ObjectId(result_id)
+
+        const nodes = await ResultNode.find({ result_id: mongoResultId })
+        return res.status(200).json(nodes)
+    } catch (error) {
+        console.error('Error fetching result nodes:', error);
+        return res.status(500).send({ error: 'Failed to fetch result nodes' });
+    }
+}
+
+module.exports = { UploadResults, GetResults, GetResultNodes };

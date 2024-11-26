@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const analysisSchema = mongoose.Schema({
     result_unique_id: {
-        type: String
+        type: String,
         ref: 'results',
         required: true
     },

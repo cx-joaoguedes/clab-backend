@@ -6,16 +6,15 @@ const scanSchema = mongoose.Schema({
         ref: 'Project',
         required: true
     },
-    content_id: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'scan_file_content.files',
-        required: true
-    },
     source: {
         type: 'String',
         required: true
     },
     type: {
+        type: 'String',
+        required: true
+    },
+    owner: {
         type: 'String',
         required: true
     }

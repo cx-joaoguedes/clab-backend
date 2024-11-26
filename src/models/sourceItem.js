@@ -19,9 +19,8 @@ const sourceItemSchema = mongoose.Schema({
     enum: ['file','dir'],
     required: true
   },
-  parent_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'SourceItem',
+  parent: {
+    type: String,
     default: null
   },
   size: {
@@ -30,12 +29,6 @@ const sourceItemSchema = mongoose.Schema({
   },
   extension: {
     type: String,
-    required: function() { return this.type === 'file'; },
-    default: null
-  },
-  content_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "SourceContent",
     default: null
   }
 });

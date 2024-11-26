@@ -1,29 +1,11 @@
 const SourceItem = require('../models/SourceItem');
 const gridFSManager = require('../config/gridfs')
+const { uploadFileToGridFS, uploadStreamToGridFS } = require('./gridfs')
 const path = require('path')
-
-const uploadFileToGridFS = async (entry) => {
-    const entryData = entry.fileBuffer
-    const entryPath = entry.path
-    try {
-        const bucket = await gridFSManager.getSourceContentBucket();
-        const metadata = {
-            project_id: entry.project_id,
-            name: entry.item_name,
-            type: entry.type
-        }
-        const uploadStream = bucket.openUploadStream(entryPath, { metadata });
-        uploadStream.end(entryData);
-        return new Promise((resolve, reject) => {
-            uploadStream.on('finish', () => resolve(uploadStream.id));
-            uploadStream.on('error', (err) => reject(err));
-        });
-    } catch (error) {
-        console.error('Error uploading file to GridFS:', error);
-        throw error;
-    }
-};
-
+const ObjectId = require('mongoose').Types.ObjectId
+const CHUNK_SIZE = 100
+const CONCURRENCY_LIMIT = 10
+const stream = require('stream');
 
 const normalizePath = (inputPath) => {
     return path
@@ -32,80 +14,139 @@ const normalizePath = (inputPath) => {
         .replace(/\/+$/, '')
 }
 
-const processEntries = (entries, project_id) => {
-    return entries.map((entry) => {
-        const entryPath = normalizePath(entry.entryName);
-        const parentPath = normalizePath(path.dirname(entryPath));
-        const nameParts = entryPath.split('/').filter(Boolean);
+const getPathData = (sourcePath) => {
+    const entryPath = normalizePath(sourcePath);
+    const parentPath = normalizePath(path.dirname(entryPath));
+    const nameParts = entryPath.split('/').filter(Boolean);
 
-        return {
-            project_id,
+    return { entryPath, parentPath, nameParts }
+}
+
+const updateRecord = async (record, attributes) => {
+    for (const [attribute, value] of Object.entries(attributes)) {
+        record[attribute] = value;
+    }
+    await record.save();
+}
+
+const traverseAndUpload = async (zip, project_id, io, socketRoom, existingProject) => {
+    const bucket = await gridFSManager.getSourceContentBucket();
+    const projectId = new ObjectId(project_id);
+    const zipEntries = zip.getEntries();
+
+    const sourceBuffer = [];
+    const fileUploadQueue = [];
+
+    const totalEntries = zipEntries.length;
+    let processedEntries = 0;
+
+    // Notify the client that processing has started
+    io.to(socketRoom).emit('start', {
+        total: totalEntries,
+    });
+
+    await updateRecord(existingProject, { 'upload_state': 'processing' })
+
+    for (const entry of zipEntries) {
+        const { entryPath, parentPath, nameParts } = getPathData(entry.entryName);
+        const type = entry.isDirectory ? 'dir' : 'file';
+        const sourceItem = {
+            project_id: projectId,
             item_name: nameParts.pop(),
             path: entryPath,
-            type: entry.isDirectory ? 'dir' : 'file',
-            parent_id: null,
-            parentPath: parentPath || '.',
+            type,
+            parent: parentPath === '.' ? null : parentPath,
             size: entry.header.size,
-            extension: path.extname(entryPath) || 'no extension',
-            content_id: null,
-            nestingLevel: nameParts.length,
-            fileBuffer: entry.getData()
+            extension: path.extname(entryPath).toLowerCase().split('.').slice(1)[0] || null,
         };
-    });
-};
+        sourceBuffer.push(sourceItem);
 
-const uploadTree = async (tree) => {
-    let currentNestingLevel = 0;
-    let uploadedItems = 0;
-    const pathToIdMap = { '.': null };
-
-    while (tree.length > 0) {
-        const levelEntries = tree.filter(entry => entry.nestingLevel === currentNestingLevel);
-        tree = tree.filter(entry => entry.nestingLevel > currentNestingLevel);
-
-        if (levelEntries.length > 0) {
-            const batch = await Promise.all(levelEntries.map(async (entry) => {
-                let content_id = null;
-
-                if (entry.type === 'file' && entry.fileBuffer) {
-                    content_id = await uploadFileToGridFS(entry);
+        if (type === 'file') {
+            const fileStream = new stream.PassThrough();
+            fileStream.end(entry.getData());
+            const contentMetadata = { project_id: projectId, path: entryPath };
+            fileUploadQueue.push(async () => {
+                try {
+                    await uploadStreamToGridFS(entryPath, fileStream, contentMetadata, bucket);
+                } catch (error) {
+                    console.error('File upload error:', error);
+                } finally {
+                    processedEntries++;
+                    io.to(socketRoom).emit('progress', {
+                        total: totalEntries,
+                        processed: processedEntries,
+                        percentage: (processedEntries / totalEntries) * 100
+                    });
                 }
-
-                return {
-                    project_id: entry.project_id,
-                    item_name: entry.item_name,
-                    path: entry.path,
-                    type: entry.type,
-                    parentPath: entry.parentPath,
-                    size: entry.size,
-                    extension: entry.extension,
-                    parent_id: pathToIdMap[entry.parentPath] || null,
-                    content_id: content_id
-                };
-            }));
-
-            const uploadedBatch = await SourceItem.insertMany(batch);
-
-            // Update pathToIdMap
-            uploadedBatch.forEach((result, index) => {
-                pathToIdMap[levelEntries[index]['path']] = result['_id'];
             });
-
-            uploadedItems += uploadedBatch.length;
+        } else {
+            processedEntries++;
+            io.to(socketRoom).emit('progress', {
+                total: totalEntries,
+                processed: processedEntries,
+                percentage: (processedEntries / totalEntries) * 100
+            });
         }
-
-        currentNestingLevel++;
     }
 
-    return uploadedItems;
+    try {
+        // Perform file uploads with limited concurrency
+        const uploadResults = await processWithConcurrency(fileUploadQueue, CONCURRENCY_LIMIT);
+
+        // Batch insert metadata into MongoDB
+        const insertedSources = [];
+        for (let i = 0; i < sourceBuffer.length; i += CHUNK_SIZE) {
+            const chunk = sourceBuffer.slice(i, i + CHUNK_SIZE);
+            const insertedChunk = await SourceItem.insertMany(chunk);
+            insertedSources.push(...insertedChunk);
+        }
+
+        const file_count = uploadResults.length
+        const dir_count = insertedSources.length - file_count
+
+        // Notify the client of successful completion
+        io.to(socketRoom).emit('complete', {
+            sourceItemCount: insertedSources.length,
+            gfsCount: uploadResults.length,
+        });
+
+        await updateRecord(existingProject, { 'upload_state': 'done', file_count, dir_count })
+
+    } catch (error) {
+        console.error('Processing error:', error);
+        io.to(socketRoom).emit('error', {
+            message: 'An error occurred during the upload process.',
+            error: error.message || 'Unknown error',
+        });
+    } finally {
+        // Clean up and close the WebSocket room
+        io.to(socketRoom).disconnectSockets();
+    }
 };
 
 
-const traverseAndUpload = async (zipEntries, project_id) => {
-    const treeEntries = await processEntries(zipEntries, project_id)
-    const itemsToUpload = uploadTree(treeEntries)
-    return itemsToUpload
-}
+
+// Custom concurrency handler
+const processWithConcurrency = async (tasks, limit) => {
+    const results = [];
+    const executing = new Set();
+
+    for (const task of tasks) {
+        const promise = task().then(result => {
+            executing.delete(promise);
+            return result;
+        });
+        results.push(promise);
+        executing.add(promise);
+
+        if (executing.size >= limit) {
+            await Promise.race(executing); // Wait for one task to complete before adding more
+        }
+    }
+
+    await Promise.all(executing); // Wait for all remaining tasks to finish
+    return results;
+};
 
 module.exports = {
     traverseAndUpload: traverseAndUpload
